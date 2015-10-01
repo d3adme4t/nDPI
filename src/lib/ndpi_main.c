@@ -838,6 +838,11 @@ static void ndpi_init_protocol_defaults(struct ndpi_detection_module_struct *ndp
 			    no_master, "IPP",
 			    ndpi_build_default_ports(ports_a, 0, 0, 0, 0, 0) /* TCP */,
 			    ndpi_build_default_ports(ports_b, 0, 0, 0, 0, 0) /* UDP */);
+    ndpi_set_proto_defaults(ndpi_mod, NDPI_PROTOCOL_ACCEPTABLE, NDPI_PROTOCOL_HEP,
+			    no_master,
+			    no_master, "HEP",
+			    ndpi_build_default_ports(ports_a, 9064, 0, 0, 0, 0) /* TCP */,
+			    ndpi_build_default_ports(ports_b, 9063, 0, 0, 0, 0) /* UDP */);
     ndpi_set_proto_defaults(ndpi_mod, NDPI_PROTOCOL_ACCEPTABLE, NDPI_PROTOCOL_HTTP,
 			    no_master,
 			    no_master, "HTTP",
@@ -1671,7 +1676,7 @@ static int fill_prefix_v4(prefix_t *p, struct in_addr *a, int b, int mb) {
 
 /* ******************************************* */
 
-u_int16_t ndpi_network_ptree_match(struct ndpi_detection_module_struct *ndpi_struct, struct in_addr *pin) {
+u_int16_t ndpi_network_ptree_match(struct ndpi_detection_module_struct *ndpi_struct, struct in_addr *pin /* network byte order */) {
   prefix_t prefix;
   patricia_node_t *node;
 
@@ -1684,7 +1689,7 @@ u_int16_t ndpi_network_ptree_match(struct ndpi_detection_module_struct *ndpi_str
 
 /* ******************************************* */
 
-u_int16_t ndpi_host_ptree_match(struct ndpi_detection_module_struct *ndpi_struct, u_int32_t host) {
+u_int16_t ndpi_host_ptree_match(struct ndpi_detection_module_struct *ndpi_struct, u_int32_t host /* network byte order */) {
   struct in_addr pin;
 
   pin.s_addr = host;
@@ -1705,11 +1710,9 @@ u_int8_t ndpi_is_tor_flow(struct ndpi_detection_module_struct *ndpi_struct,
   struct ndpi_packet_struct *packet = &flow->packet;
 
   if(packet->tcp != NULL) {
-    if(flow->packet.iph) {
-      struct in_addr saddr = { packet->iph->saddr };
-      struct in_addr daddr = { packet->iph->daddr };
-      if(tor_ptree_match(ndpi_struct, &saddr)
-         || tor_ptree_match(ndpi_struct, &daddr)) {
+    if(packet->iph) {
+      if(tor_ptree_match(ndpi_struct, (struct in_addr *)&packet->iph->saddr)
+         || tor_ptree_match(ndpi_struct, (struct in_addr *)&packet->iph->daddr)) {
 	return(1);
       }
     }
@@ -1760,7 +1763,6 @@ static int ndpi_add_host_ip_subprotocol(struct ndpi_detection_module_struct *ndp
   struct in_addr pin;
   
   inet_pton(AF_INET, value, &pin);
-  pin.s_addr = ntohl(pin.s_addr);
   
   if((node = add_to_ptree(ndpi_struct->protocols_ptree, AF_INET, &pin, 32)) != NULL) {
     node->value.user_value = protocol_id;
@@ -2264,6 +2266,9 @@ void ndpi_set_protocol_detection_bitmask2(struct ndpi_detection_module_struct *n
 
   /* SIP */
   init_sip_dissector(ndpi_struct, &a, detection_bitmask);
+
+  /* HEP */
+  init_hep_dissector(ndpi_struct, &a, detection_bitmask);
 
   /* BITTORRENT */
   init_bittorrent_dissector(ndpi_struct, &a, detection_bitmask);
@@ -3432,12 +3437,9 @@ ndpi_protocol ndpi_detection_process_packet(struct ndpi_detection_module_struct 
   if((ret.protocol == NDPI_PROTOCOL_UNKNOWN)
      && flow->packet.iph
      && (!flow->host_already_guessed)) {
-    struct in_addr pin;
     
-    pin.s_addr = flow->packet.iph->saddr;
-    if((flow->guessed_host_proto_id = ndpi_network_ptree_match(ndpi_struct, &pin)) == NDPI_PROTOCOL_UNKNOWN) {
-      pin.s_addr = flow->packet.iph->daddr;
-      flow->guessed_host_proto_id = ndpi_network_ptree_match(ndpi_struct, &pin);
+    if((flow->guessed_host_proto_id = ndpi_network_ptree_match(ndpi_struct, (struct in_addr *)&flow->packet.iph->saddr)) == NDPI_PROTOCOL_UNKNOWN) {
+      flow->guessed_host_proto_id = ndpi_network_ptree_match(ndpi_struct, (struct in_addr *)&flow->packet.iph->daddr);
     }
     
     flow->host_already_guessed = 1;
@@ -4177,11 +4179,11 @@ ndpi_protocol ndpi_guess_undetected_protocol(struct ndpi_detection_module_struct
       return(ret);    
 
   check_guessed_skype:
-    addr.s_addr = shost;
+    addr.s_addr = htonl(shost);
     if(ndpi_network_ptree_match(ndpi_struct, &addr) == NDPI_PROTOCOL_SKYPE) {
       ret.protocol = NDPI_PROTOCOL_SKYPE;
     } else {
-      addr.s_addr = dhost;
+      addr.s_addr = htonl(dhost);
       if(ndpi_network_ptree_match(ndpi_struct, &addr) == NDPI_PROTOCOL_SKYPE)
 	ret.protocol = NDPI_PROTOCOL_SKYPE;
     }
