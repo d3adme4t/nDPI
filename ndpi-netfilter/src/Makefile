@@ -54,6 +54,7 @@ xt_ndpi-y := main.o \
 		${NDPI_PRO}/guildwars.o \
 		${NDPI_PRO}/h323.o \
 		${NDPI_PRO}/halflife2_and_mods.o \
+		${NDPI_PRO}/hep.o \
 		${NDPI_PRO}/http.o \
 		${NDPI_PRO}/http_activesync.o \
 		${NDPI_PRO}/iax.o \
