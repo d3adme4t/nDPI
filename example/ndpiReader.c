@@ -1744,17 +1744,6 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
   } else if(ndpi_thread_info[thread_id]._pcap_datalink_type == 113 /* Linux Cooked Capture */) {
     type = (packet[14] << 8) + packet[15];
     ip_offset = 16;
-  } else if(ndpi_thread_info[thread_id]._pcap_datalink_type == 239 /* Linux NFLOG */) {
-    u_int32_t * data = (void *)packet;
-    int xc;
-    ip_offset = 108;
-    type = ETH_P_IP;
-/*    for(xc=0; xc < 48; xc++) {
-	    printf(" %08x%s",htonl(data[xc]),(xc & 7) == 7 ? "\n":"");
-	
-    }
-	  printf("nflog ip_offset %d, type %04x\n",
-			  ip_offset,type); */
   } else {
 	  printf("unknown link type %02x\n",ndpi_thread_info[thread_id]._pcap_datalink_type);
     	return;
