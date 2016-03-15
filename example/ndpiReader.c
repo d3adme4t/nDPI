@@ -43,6 +43,10 @@
 #include <signal.h>
 #include <pthread.h>
 
+#ifdef linux
+#include <pcap/nflog.h>
+#endif
+
 #include "../config.h"
 
 #ifdef HAVE_JSON_C
@@ -52,7 +56,7 @@
 #define BT_ANNOUNCE
 
 #include "ndpi_api.h"
-
+#include "src/lib/third_party/include/ndpi_patricia.h"
 extern int bt_parse_debug;
 #include <sys/socket.h>
 
@@ -93,6 +97,7 @@ static u_int32_t current_ndpi_memory = 0, max_ndpi_memory = 0;
 #ifdef linux
 static int core_affinity[MAX_NUM_READER_THREADS];
 #endif
+static int dump_ip_tree=0;
 
 static struct timeval pcap_start, pcap_end;
 
@@ -186,6 +191,7 @@ typedef struct ndpi_flow {
 
   u_int64_t bytes;
   u_int32_t packets;
+  u_int32_t nf_mark;
 
   // result only, not used for flow identification
   ndpi_protocol detected_protocol;
@@ -223,6 +229,7 @@ static void help(u_int long_help) {
 	 "  -d                        | Disable protocol guess and use only DPI\n"
 	 "  -q                        | Quiet mode\n"
 	 "  -t                        | Dissect GTP tunnels\n"
+	 "  -T                        | Dump IP tree and exit\n"
 	 "  -B <4-32>                 | Bittorent hash size\n"
 	 "  -r                        | Print nDPI version and git revision\n"
 	 "  -w <path>                 | Write test output on the specified file. This is useful for\n"
@@ -249,7 +256,7 @@ static void parseOptions(int argc, char **argv) {
   u_int num_cores = sysconf(_SC_NPROCESSORS_ONLN);
 #endif
 
-  while ((opt = getopt(argc, argv, "df:g:i:hp:l:s:tv:V:n:j:rp:w:qB:")) != EOF) {
+  while ((opt = getopt(argc, argv, "df:g:i:hp:l:s:tTv:V:n:j:rp:w:qB:")) != EOF) {
     switch (opt) {
     case 'd':
       enable_protocol_guess = 0;
@@ -286,6 +293,10 @@ static void parseOptions(int argc, char **argv) {
 
     case 't':
       decode_tunnels = 1;
+      break;
+
+    case 'T':
+      dump_ip_tree = 1;
       break;
 
     case 'r':
@@ -594,8 +605,17 @@ static void printFlow(u_int16_t thread_id, struct ndpi_flow *flow) {
 	      flow->detected_protocol.protocol,
 	      ndpi_get_proto_name(ndpi_thread_info[thread_id].ndpi_struct, flow->detected_protocol.protocol));
 
+    if(flow->nf_mark) {
+	    if(flow->nf_mark != flow->detected_protocol.protocol && 
+		    flow->nf_mark != flow->detected_protocol.master_protocol)
+	   fprintf(out, "[NF:%s]",ndpi_get_proto_name(ndpi_thread_info[thread_id].ndpi_struct, flow->nf_mark));
+    } else
+	   fprintf(out, "[NONF]");
+
     fprintf(out, "[%u pkts/%llu bytes]",
 	   flow->packets, (long long unsigned int)flow->bytes);
+    if(flow->protocol == IPPROTO_TCP && !flow->ndpi_flow->tcp_data)
+	    fprintf(out, "[SYN]");
 
     if(flow->host_server_name[0] != '\0') fprintf(out, "[Host: %s]", flow->host_server_name);
     if(flow->ssl.client_certificate[0] != '\0') fprintf(out, "[SSL client: %s]", flow->ssl.client_certificate);
@@ -937,8 +957,8 @@ static struct ndpi_flow *get_ndpi_flow(u_int16_t thread_id,
       newflow->d_port = d_port;
 
       if(version == 4) {
-	inet_ntop(AF_INET, &lower_ip, newflow->lower_name, sizeof(newflow->lower_name));
-	inet_ntop(AF_INET, &upper_ip, newflow->upper_name, sizeof(newflow->upper_name));
+	inet_ntop(AF_INET, &iph->saddr, newflow->lower_name, sizeof(newflow->lower_name));
+	inet_ntop(AF_INET, &iph->daddr, newflow->upper_name, sizeof(newflow->upper_name));
       } else {
 	inet_ntop(AF_INET6, &iph6->ip6_src, newflow->lower_name, sizeof(newflow->lower_name));
 	inet_ntop(AF_INET6, &iph6->ip6_dst, newflow->upper_name, sizeof(newflow->upper_name));
@@ -1031,6 +1051,32 @@ static struct ndpi_flow *get_ndpi_flow6(u_int16_t thread_id,
 
 /* ***************************************************** */
 
+void print_pt_node(patricia_node_t *pn) {
+char bp[8];
+prefix4_t *p4 = (prefix4_t *)pn->prefix;
+
+if(pn->prefix->family != AF_INET) return;
+sprintf(bp,"/%d",p4->bitlen);
+printf("%s%s %s (0x%x)\n",inet_ntoa(p4->sin),p4->bitlen != 32 ? bp:"",
+      ndpi_get_proto_name(ndpi_thread_info[0].ndpi_struct, pn->value.user_value),
+      pn->value.user_value);
+}
+
+void do_print_ip_tree(struct ndpi_detection_module_struct *	ndpi_str) {
+
+patricia_tree_t *pt = ndpi_str->protocols_ptree;
+patricia_node_t *node;
+
+if(!pt) abort();
+PATRICIA_WALK (pt->head, node) {
+	print_pt_node(node);
+}
+PATRICIA_WALK_END;
+
+}
+
+/* ***************************************************** */
+
 static void setupDetection(u_int16_t thread_id) {
   NDPI_PROTOCOL_BITMASK all;
 
@@ -1063,8 +1109,11 @@ static void setupDetection(u_int16_t thread_id) {
 
   if(_protoFilePath != NULL)
     ndpi_load_protocols_file(ndpi_thread_info[thread_id].ndpi_struct, _protoFilePath);
+  if(dump_ip_tree) {
+	do_print_ip_tree(ndpi_thread_info[thread_id].ndpi_struct);
+	exit(0);
+  }
 }
-
 /* ***************************************************** */
 
 
@@ -1088,7 +1137,8 @@ static unsigned int packet_processing(u_int16_t thread_id,
 				      const struct ndpi_iphdr *iph,
 				      struct ndpi_ip6_hdr *iph6,
 				      u_int16_t ip_offset,
-				      u_int16_t ipsize, u_int16_t rawsize) {
+				      u_int16_t ipsize, u_int16_t rawsize,
+				      uint32_t nf_mark) {
   struct ndpi_id_struct *src, *dst;
   struct ndpi_flow *flow;
   struct ndpi_flow_struct *ndpi_flow = NULL;
@@ -1103,15 +1153,15 @@ static unsigned int packet_processing(u_int16_t thread_id,
   else
     flow = get_ndpi_flow6(thread_id, vlan_id, iph6, ip_offset, &src, &dst, &proto, &dir);
 
-  if(flow != NULL) {
-    ndpi_thread_info[thread_id].stats.ip_packet_count++;
-    ndpi_thread_info[thread_id].stats.total_wire_bytes += rawsize + 24 /* CRC etc */, ndpi_thread_info[thread_id].stats.total_ip_bytes += rawsize;
-    ndpi_flow = flow->ndpi_flow;
-    flow->packets++, flow->bytes += rawsize;
-    flow->last_seen = time;
-  } else {
-    return(0);
-  }
+  if(flow == NULL) return 0;
+  
+  if(!flow->nf_mark && nf_mark) flow->nf_mark = nf_mark;
+
+  ndpi_thread_info[thread_id].stats.ip_packet_count++;
+  ndpi_thread_info[thread_id].stats.total_wire_bytes += rawsize + 24 /* CRC etc */, ndpi_thread_info[thread_id].stats.total_ip_bytes += rawsize;
+  ndpi_flow = flow->ndpi_flow;
+  flow->packets++, flow->bytes += rawsize;
+  flow->last_seen = time;
 
   if(flow->detection_completed &&
 	flow->detected_protocol.protocol != NDPI_PROTOCOL_BITTORRENT)
@@ -1690,6 +1740,83 @@ static void openPcapFileOrDevice(u_int16_t thread_id) {
 
 }
 
+#ifdef linux
+
+/* copy from tcpdump/print-nflog.c  */
+static const u_char *parse_nflog_packet(const struct pcap_pkthdr *h, const u_char *p,
+		u_int *r_length, uint32_t *mark)
+{
+	const nflog_hdr_t *hdr = (const nflog_hdr_t *)p;
+	const nflog_tlv_t *tlv;
+	uint16_t size;
+	uint16_t h_size = sizeof(nflog_hdr_t);
+
+	u_int caplen = h->caplen;
+
+	u_int length = h->len;
+
+	if (caplen < (int) sizeof(nflog_hdr_t) || length < (int) sizeof(nflog_hdr_t)) {
+		return NULL;
+	}
+
+	if (!(hdr->nflog_version) == 0) {
+		return NULL;
+	}
+
+	p += sizeof(nflog_hdr_t);
+	length -= sizeof(nflog_hdr_t);
+	caplen -= sizeof(nflog_hdr_t);
+
+	while (length > 0) {
+		/* We have some data.  Do we have enough for the TLV header? */
+		if (caplen < sizeof(nflog_tlv_t) || length < sizeof(nflog_tlv_t)) {
+			/* No. */
+			return NULL;
+		}
+
+		tlv = (const nflog_tlv_t *) p;
+		size = tlv->tlv_length;
+		if (size % 4 != 0)
+			size += 4 - size % 4;
+
+		/* Is the TLV's length less than the minimum? */
+		if (size < sizeof(nflog_tlv_t)) {
+			/* Yes. Give up now. */
+			return NULL;
+		}
+
+		/* Do we have enough data for the full TLV? */
+		if (caplen < size || length < size) {
+			/* No. */
+			return NULL;
+		}
+
+		if (tlv->tlv_type == NFULA_PAYLOAD) {
+			/*
+			 * This TLV's data is the packet payload.
+			 * Skip past the TLV header, and break out
+			 * of the loop so we print the packet data.
+			 */
+			p += sizeof(nflog_tlv_t);
+			h_size += sizeof(nflog_tlv_t);
+			length -= sizeof(nflog_tlv_t);
+			caplen -= sizeof(nflog_tlv_t);
+			break;
+		}
+		if(tlv->tlv_type == NFULA_MARK && mark != NULL) {
+			const u_char *adata = p+sizeof(nflog_tlv_t);
+			*mark = htonl(*(u_int32_t *)adata);
+		}
+		p += size;
+		h_size += size;
+		length -= size;
+		caplen -= size;
+	}
+	*r_length = length;
+	return p;
+}
+#endif
+
 /* ***************************************************** */
 
 static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header, const u_char *packet) {
@@ -1701,6 +1828,8 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
   u_int16_t frag_off = 0, vlan_id = 0;
   u_int8_t proto = 0, vlan_packet = 0;
   u_int16_t thread_id = *((u_int16_t*)args);
+  u_int32_t h_caplen,h_len;
+  uint32_t nf_mark = 0;
 
   if(!live_capture) {
 	  if(capture_for == 1 ) return;
@@ -1729,6 +1858,8 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
     time = ndpi_thread_info[thread_id].last_time;
   }
   ndpi_thread_info[thread_id].last_time = time;
+  h_caplen = header->caplen;
+  h_len = header->len;
 
   if(ndpi_thread_info[thread_id]._pcap_datalink_type == DLT_NULL) {
     if(ntohl(*((u_int32_t*)packet)) == 2)
@@ -1744,7 +1875,20 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
   } else if(ndpi_thread_info[thread_id]._pcap_datalink_type == 113 /* Linux Cooked Capture */) {
     type = (packet[14] << 8) + packet[15];
     ip_offset = 16;
-  } else {
+  } else
+#ifdef linux
+    if(ndpi_thread_info[thread_id]._pcap_datalink_type == DLT_NFLOG) {
+    packet = parse_nflog_packet(header,packet,&h_caplen,&nf_mark);
+
+    if(!packet) return;
+
+    ip_offset = 0;
+    h_len = h_caplen;
+    type = ETH_P_IP;
+
+  } else 
+#endif
+  {
 	  printf("unknown link type %02x\n",ndpi_thread_info[thread_id]._pcap_datalink_type);
     	return;
   }
@@ -1778,11 +1922,11 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
   iph = (struct ndpi_iphdr *) &packet[ip_offset];
 
   // just work on Ethernet packets that contain IP
-  if(type == ETH_P_IP && header->caplen >= ip_offset) {
+  if(type == ETH_P_IP && h_caplen >= ip_offset) {
     frag_off = ntohs(iph->frag_off);
 
     proto = iph->protocol;
-    if(header->caplen < header->len) {
+    if(h_caplen < h_len) {
       static u_int8_t cap_warning_used = 0;
 
       if(cap_warning_used == 0) {
@@ -1805,7 +1949,7 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
 	ipv4_frags_warning_used = 1;
       }
 
-      ndpi_thread_info[thread_id].stats.total_discarded_bytes +=  header->len;
+      ndpi_thread_info[thread_id].stats.total_discarded_bytes +=  h_len;
       return;
     }
   } else if(iph->version == 6) {
@@ -1830,7 +1974,7 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
       ipv4_warning_used = 1;
     }
 
-    ndpi_thread_info[thread_id].stats.total_discarded_bytes +=  header->len;
+    ndpi_thread_info[thread_id].stats.total_discarded_bytes +=  h_len;
     return;
   }
 
@@ -1863,7 +2007,7 @@ static void pcap_packet_callback(u_char *args, const struct pcap_pkthdr *header,
 
   // process the packet
   packet_processing(thread_id, time, vlan_id, iph, iph6,
-		    ip_offset, header->len - ip_offset, header->len);
+		    ip_offset, h_len - ip_offset, h_len, nf_mark);
 }
 
 /* ******************************************************************** */
@@ -1898,7 +2042,10 @@ void *processing_thread(void *_thread_id) {
 
   if(playlist_fp[thread_id] != NULL) { /* playlist: read next file */
     char filename[256];
-
+    if(ndpi_thread_info[thread_id]._pcap_handle) {
+	closePcapFile(thread_id);
+	ndpi_thread_info[thread_id]._pcap_handle = NULL;
+    }
     if(getNextPcapFileFromPlaylist(thread_id, filename, sizeof(filename)) == 0 &&
        (ndpi_thread_info[thread_id]._pcap_handle = pcap_open_offline(filename, ndpi_thread_info[thread_id]._pcap_error_buffer)) != NULL) {
       configurePcapHandle(thread_id);

@@ -1841,7 +1841,10 @@ struct ndpi_detection_module_struct *ndpi_init_detection_module(u_int32_t ticks_
 
 /* *********************************************** */
 
-static void free_ptree_data(void *data) { ; }
+static void free_ptree_data(void *data) { 
+if(data) 
+	ndpi_free(data);
+}
 
 /* ****************************************************** */
 
@@ -3051,6 +3054,10 @@ void ndpi_connection_tracking(struct ndpi_detection_module_struct *ndpi_struct,
        && flow->l4.tcp.seen_ack == 0) {
       flow->l4.tcp.seen_ack = 1;
     }
+
+    if(tcph->syn == 0)
+	    flow->tcp_data = 1; // use for print tcp connect with data ( not SYN only )
+
     if((flow->next_tcp_seq_nr[0] == 0 && flow->next_tcp_seq_nr[1] == 0)
        || (proxy_enabled && (flow->next_tcp_seq_nr[0] == 0 || flow->next_tcp_seq_nr[1] == 0))) {
       /* initalize tcp sequence counters */
